@@ -3,11 +3,13 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "common/config.h"
 #include "page.h"
@@ -27,12 +29,22 @@ private:
     std::unique_ptr<Replacer> replacer_;                             ///< 独占的淘汰器，当前为 LRU。
     mutable std::mutex latch_;                                       ///< 保护页表、空闲链表和诊断快照。
 
+    /**
+     * @brief 标记"该帧正在从磁盘装载"。
+     *
+     * 装载期间帧已登记进页表且 pin_count_ > 0，所以不会被淘汰或复用；但数据还没就绪，
+     * 此时若有其它线程 fetch 同一个 page_id，绝不能把半成品页面交出去，必须等待装载完成。
+     */
+    std::vector<bool> frame_loading_;
+    std::condition_variable frame_ready_;  ///< 配合 frame_loading_ 广播"帧内容已就绪"。
+
 public:
     BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
         : pool_size_(pool_size),
           pages_(std::make_unique<Page[]>(pool_size_)),
           disk_manager_(disk_manager),
-          replacer_(std::make_unique<LRUReplacer>(pool_size_)) {
+          replacer_(std::make_unique<LRUReplacer>(pool_size_)),
+          frame_loading_(pool_size_, false) {
         for (size_t i = 0; i < pool_size_; ++i) {
             free_list_.emplace_back(static_cast<frame_id_t>(i));
         }

@@ -31,6 +31,9 @@ CMakeUserPresets.json
 /src/parser/build/
 *.zip
 
+# local scratch (本机验证辅助材料)
+/.local_verify/
+
 deps/*
 !deps/nlohmann/
 .dockerignore
