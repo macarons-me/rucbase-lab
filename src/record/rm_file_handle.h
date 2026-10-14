@@ -125,12 +125,13 @@ public:
 
     void update_record(const Rid& rid, const char* buf, Context* context);
 
-    RmPageHandle create_new_page_handle();
-
-    RmPageHandle fetch_page_handle(int page_no) const;
-
 private:
-    RmPageHandle create_page_handle();
+    /** @brief 分配一张新数据页并挂到空闲页链表头，返回其 guard（已固定、已置脏）。 */
+    RmPageGuard create_new_page_guard();
 
-    void release_page_handle(RmPageHandle& page_handle);
+    /** @brief 返回一张未满数据页的 guard：优先复用空闲链表头，否则新建一页。 */
+    RmPageGuard create_free_page_guard();
+
+    /** @brief 页面从已满变为未满时，把它重新挂到空闲页链表头。 */
+    void push_free_page(RmPageGuard& page);
 };
