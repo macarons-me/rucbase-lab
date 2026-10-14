@@ -17,10 +17,9 @@
  *   I2 Page::pin_count_ > 0 的帧一定不在 replacer_ 中；pin_count_ 归零时必须立即 unpin。
  *   I3 同一帧不会同时出现在 free_list_ 和 replacer_ 中：帧要么空闲，要么已被淘汰器接管。
  *   I4 只有 pin_count_ == 0 的帧才允许被淘汰或删除，因此调用方持有的 Page* 在 pin 期间稳定。
- *   I5 frame_loading_ 为真表示该帧正在从磁盘装载：数据尚未就绪，此时任何 fetch 到同一
- *      page_id 的线程都必须等待装载结束，否则会把 update_page 清空后的半成品页面当成磁盘内容。
- * 所有会改动上述结构的操作都在 latch_ 保护下进行；磁盘 I/O 尽量放在临界区之外，
- * 以免一次缺页读盘阻塞整个缓冲池，同时保持 I1～I5 对外始终成立。
+ * 所有会改动上述结构的操作都在 latch_ 保护下进行。磁盘 I/O 也必须在 latch_ 内完成：
+ * DiskManager 用 "lseek + read/write" 两个系统调用定位页面，若并发线程在两次调用之间
+ * 插入自己的 lseek，就会读错页或写错位置，因此定址与读写必须成对原子。
  */
 
 /**
@@ -79,75 +78,44 @@ void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t n
  * @param {PageId} page_id 需要获取的页的PageId
  */
 Page* BufferPoolManager::fetch_page(PageId page_id) {
+    std::scoped_lock lock{latch_};
+
     //  1.     从page_table_中搜寻目标页
     //  1.1    若目标页有被page_table_记录，则将其所在frame固定(pin)，并返回目标页。
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end()) {
+        const frame_id_t frame_id = it->second;
+        Page* page = &pages_[frame_id];
+        // 页面已在内存中，直接固定并返回。pin_count_ 由 0 变为 1 时需从淘汰器摘除，
+        // 否则该帧可能被重复选中淘汰，破坏不变量 I2。
+        if (page->pin_count_ == 0) {
+            replacer_->pin(frame_id);
+        }
+        page->pin_count_++;
+        return page;
+    }
+
+    //  1.2    否则，尝试调用find_victim_page获得一个可用的frame，若失败则返回nullptr
     frame_id_t frame_id = INVALID_FRAME_ID;
-    Page* page = nullptr;
-    {
-        // 这里必须用 unique_lock：等待"帧装载完成"时条件变量需要释放/重获锁
-        std::unique_lock<std::mutex> lock{latch_};
-        auto it = page_table_.find(page_id);
-        if (it != page_table_.end()) {
-            frame_id = it->second;
-            page = &pages_[frame_id];
-            // 该帧可能正在被另一个线程从磁盘装载（见 I5）：装载期间数据尚未就绪，
-            // 必须等它读完才能把页面交出去，否则会读到 update_page 清空后的零数据。
-            // 这里用 while 而非 if：被唤醒后要重新确认装载确实结束。
-            while (frame_loading_[static_cast<size_t>(frame_id)]) {
-                frame_ready_.wait(lock);
-            }
-            // 页面已在内存中，直接固定并返回。pin_count_ 由 0 变为 1 时需从淘汰器摘除，
-            // 否则该帧可能被重复选中淘汰，破坏不变量 I2。
-            if (page->pin_count_ == 0) {
-                replacer_->pin(frame_id);
-            }
-            page->pin_count_++;
-            return page;
-        }
-
-        //  1.2    否则，尝试调用find_victim_page获得一个可用的frame，若失败则返回nullptr
-        if (!find_victim_page(&frame_id)) {
-            return nullptr;
-        }
-
-        //  2.     若获得的可用frame存储的为dirty page，则须调用updata_page将page写回到磁盘
-        //  3.     更新页表和页面
-        page = &pages_[frame_id];
-        update_page(page, page_id, frame_id);
-
-        //  4.     固定目标页，更新pin_count_
-        page->pin_count_ = 1;
-        replacer_->pin(frame_id);
-
-        // 标记"开始装载"：此时该页已进入页表，其它线程若 fetch 同一 page_id，
-        // 会在上面的 while 处等待，直到下面的 read_page 完成并广播。
-        frame_loading_[static_cast<size_t>(frame_id)] = true;
+    if (!find_victim_page(&frame_id)) {
+        return nullptr;
     }
 
-    //  3.     调用disk_manager_的read_page读取目标页到frame
-    // 读盘放在临界区之外：此时该帧已登记进页表且 pin_count_ == 1，
-    // 既不会被淘汰，也不会被 delete_page() 回收，可以安全写入。
-    try {
-        disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-    } catch (...) {
-        // 读盘失败时回滚登记，避免页表里留下一个内容无效的页面
-        std::scoped_lock lock{latch_};
-        frame_loading_[static_cast<size_t>(frame_id)] = false;
-        page_table_.erase(page_id);
-        page->pin_count_ = 0;
-        page->id_ = PageId{};
-        page->reset_memory();
-        free_list_.push_back(frame_id);
-        frame_ready_.notify_all();
-        throw;
-    }
+    //  2.     若获得的可用frame存储的为dirty page，则须调用updata_page将page写回到磁盘
+    //  3.     更新页表和页面
+    Page* page = &pages_[frame_id];
+    update_page(page, page_id, frame_id);
 
-    {
-        // 装载完成：先清标记再广播，唤醒等待同一帧的线程（它们会在 while 处重新判断）
-        std::scoped_lock lock{latch_};
-        frame_loading_[static_cast<size_t>(frame_id)] = false;
-        frame_ready_.notify_all();
-    }
+    //  4.     调用disk_manager_的read_page读取目标页到frame，并固定该页
+    //
+    // 读盘必须在 latch_ 之内完成：DiskManager 用 "lseek(fd, offset) + read(fd)" 两个
+    // 系统调用定位页面，二者之间若被其它线程插入自己的 lseek，本次 read 就会读到别的页。
+    // 缓冲池是这些系统调用的调用者，只有把 I/O 一起放进临界区，才能保证同一 fd 上的
+    // 定址与读写成对原子。若把读盘放到锁外，ConcurrencyTest 会读到错页数据并触发
+    // DiskManager::read_page Error。
+    disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    page->pin_count_ = 1;
+    replacer_->pin(frame_id);
 
     //  5.     返回目标页
     return page;
