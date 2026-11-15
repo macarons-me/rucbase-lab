@@ -297,6 +297,8 @@ BPlusTree::BPlusTree(DiskManager* disk_manager, BufferPoolManager* buffer_pool_m
  * @param transaction 事务参数，如果不需要则默认传入nullptr
  * @param find_first 是否从叶子链表的最左端开始查找
  * @return 目标叶子结点（IndexNode 离开作用域即 unpin）以及根结点是否加锁
+ * @note 任务4方法一（粗粒度）：本函数自身不加锁，只在已持有 root_latch_ 的公开入口
+ *       临界区内被调用，因此返回的"根结点是否加锁"恒为 false（该标志供选做的蟹行协议使用）。
  */
 std::pair<IndexNode, bool> BPlusTree::find_leaf_page(const char* key,
                                                      IndexOperation operation,
@@ -346,6 +348,11 @@ std::pair<IndexNode, bool> BPlusTree::find_leaf_page(const char* key,
  * @note 非唯一索引中，同一 key 的记录可能因分裂分布在多个相邻叶子里。
  */
 bool BPlusTree::get_value(const char* key, std::vector<Rid>* result, Transaction* transaction) {
+    std::scoped_lock lock{root_latch_};
+    return get_value_impl(key, result, transaction);
+}
+
+bool BPlusTree::get_value_impl(const char* key, std::vector<Rid>* result, Transaction* transaction) {
     if (result == nullptr) {
         throw InternalError("get_value requires a non-null result vector");
     }
@@ -529,10 +536,13 @@ void BPlusTree::insert_into_parent(IndexNode& old_node,
  * @pre 调用方不会重复插入完全相同的 (key, value)。
  */
 page_id_t BPlusTree::insert_entry(const char* key, const Rid& value, Transaction* transaction) {
+    std::scoped_lock lock{root_latch_};
+
     // 在任何修改之前判重，保证抛异常时树保持不变、也不遗留 pin。
+    // 判重与插入在同一临界区内完成，唯一索引的并发插入不会同时通过检查。
     if (is_unique()) {
         std::vector<Rid> existing;
-        if (get_value(key, &existing, transaction)) {
+        if (get_value_impl(key, &existing, transaction)) {
             throw DuplicateKeyError();
         }
     }
@@ -565,6 +575,8 @@ page_id_t BPlusTree::insert_entry(const char* key, const Rid& value, Transaction
  * @return 该 (key, rid) 存在并被删除时返回 true
  */
 bool BPlusTree::delete_entry(const char* key, const Rid& rid, Transaction* transaction) {
+    std::scoped_lock lock{root_latch_};
+
     if (is_empty()) {
         return false;
     }
@@ -854,6 +866,7 @@ bool BPlusTree::coalesce(IndexNode& neighbor_node,
  * @note IndexPosition 描述索引内部位置，Rid 描述表记录位置，二者含义不同。
  */
 Rid BPlusTree::get_rid(const IndexPosition& position) const {
+    std::scoped_lock lock{root_latch_};
     IndexNode node = fetch_node(position.page_no);
     if (!node.valid() || position.slot_no < 0 || position.slot_no >= node->get_size()) {
         throw IndexEntryNotFoundError();
@@ -871,6 +884,8 @@ Rid BPlusTree::get_rid(const IndexPosition& position) const {
  *       IndexScan::next() 产生的位置直接比较。
  */
 IndexPosition BPlusTree::lower_bound(const char* key) {
+    std::scoped_lock lock{root_latch_};
+
     auto [leaf, root_is_latched] = find_leaf_page(key, IndexOperation::Find, nullptr);
     static_cast<void>(root_is_latched);
     if (!leaf.valid()) {
@@ -899,7 +914,7 @@ IndexPosition BPlusTree::lower_bound(const char* key) {
         }
         if (leaf->get_page_no() == file_header_->last_leaf_ || leaf->get_next_leaf() == INDEX_LEAF_HEADER_PAGE ||
             leaf->get_next_leaf() == INDEX_NO_PAGE) {
-            return leaf_end();
+            return leaf_end_impl();
         }
 
         IndexNode next = fetch_node(leaf->get_next_leaf());
@@ -918,6 +933,8 @@ IndexPosition BPlusTree::lower_bound(const char* key) {
  * @note 位置规范与 lower_bound() 相同。
  */
 IndexPosition BPlusTree::upper_bound(const char* key) {
+    std::scoped_lock lock{root_latch_};
+
     auto [leaf, root_is_latched] = find_leaf_page(key, IndexOperation::Find, nullptr);
     static_cast<void>(root_is_latched);
     if (!leaf.valid()) {
@@ -931,7 +948,7 @@ IndexPosition BPlusTree::upper_bound(const char* key) {
         }
         if (leaf->get_page_no() == file_header_->last_leaf_ || leaf->get_next_leaf() == INDEX_LEAF_HEADER_PAGE ||
             leaf->get_next_leaf() == INDEX_NO_PAGE) {
-            return leaf_end();
+            return leaf_end_impl();
         }
 
         IndexNode next = fetch_node(leaf->get_next_leaf());
@@ -949,6 +966,11 @@ IndexPosition BPlusTree::upper_bound(const char* key) {
  * @return IndexPosition
  */
 IndexPosition BPlusTree::leaf_end() const {
+    std::scoped_lock lock{root_latch_};
+    return leaf_end_impl();
+}
+
+IndexPosition BPlusTree::leaf_end_impl() const {
     IndexNode node = fetch_node(file_header_->last_leaf_);
     if (!node.valid()) {
         throw InternalError("failed to fetch last leaf for index scan");
@@ -962,7 +984,10 @@ IndexPosition BPlusTree::leaf_end() const {
  *
  * @return IndexPosition
  */
-IndexPosition BPlusTree::leaf_begin() const { return {.page_no = file_header_->first_leaf_, .slot_no = 0}; }
+IndexPosition BPlusTree::leaf_begin() const {
+    std::scoped_lock lock{root_latch_};
+    return {.page_no = file_header_->first_leaf_, .slot_no = 0};
+}
 
 IndexNode BPlusTree::fetch_node(page_id_t page_no) const {
     PageGuard guard = buffer_pool_manager_->fetch_page_guard(PageId{.fd = file_descriptor_, .page_no = page_no});

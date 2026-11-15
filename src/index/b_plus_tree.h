@@ -205,7 +205,10 @@ private:
     BufferPoolManager* buffer_pool_manager_;        ///< 非拥有指针。
     int file_descriptor_;                           ///< 索引文件描述符。
     std::unique_ptr<IndexFileHeader> file_header_;  ///< 独占的内存文件头副本。
-    std::mutex root_latch_;
+    /// 任务4方法一：整树粗粒度互斥锁。所有读写树结构的公开入口（get_value、insert_entry、
+    /// delete_entry、lower_bound、upper_bound、get_rid、leaf_begin、leaf_end）在函数开头
+    /// 持锁，内部辅助函数一律不持锁，保证临界区内不会重复加锁。const 入口也要持锁，故为 mutable。
+    mutable std::mutex root_latch_;
 
 public:
     BPlusTree(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, int file_descriptor);
@@ -269,4 +272,9 @@ public:
 private:
     void set_root_page(page_id_t root) { file_header_->root_page_ = root; }
     [[nodiscard]] bool is_empty() const { return file_header_->root_page_ == INDEX_NO_PAGE; }
+
+    /** @brief get_value 的免锁实现；调用方必须已持有 root_latch_。 */
+    bool get_value_impl(const char* key, std::vector<Rid>* result, Transaction* transaction);
+    /** @brief leaf_end 的免锁实现；调用方必须已持有 root_latch_。 */
+    [[nodiscard]] IndexPosition leaf_end_impl() const;
 };
