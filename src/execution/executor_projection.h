@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -39,11 +40,39 @@ public:
         len_ = curr_offset;
     }
 
-    void begin_tuple() override { throw NotImplementedError("ProjectionExecutor::begin_tuple"); }
+    void begin_tuple() override { prev_->begin_tuple(); }
 
-    void next_tuple() override { throw NotImplementedError("ProjectionExecutor::next_tuple"); }
+    void next_tuple() override { prev_->next_tuple(); }
 
-    std::unique_ptr<RmRecord> next() override { throw NotImplementedError("ProjectionExecutor::next"); }
+    /**
+     * @brief 按 sel_idxs_ 从孩子记录中取出需要投影的字段，拼成新的记录。
+     *
+     * @return 投影后的记录；不推进孩子的迭代位置。
+     * @throws InternalError 孩子在到达结尾后仍被调用 next()。
+     */
+    std::unique_ptr<RmRecord> next() override {
+        auto prev_record = prev_->next();
+        if (prev_record == nullptr) {
+            throw InternalError("ProjectionExecutor received a null record from its child");
+        }
+
+        auto record = std::make_unique<RmRecord>(static_cast<int>(len_));
+        const auto& prev_cols = prev_->cols();
+        for (size_t i = 0; i < cols_.size(); ++i) {
+            const ColMeta& src_col = prev_cols[sel_idxs_[i]];
+            std::memcpy(record->data + cols_[i].offset, prev_record->data + src_col.offset,
+                        static_cast<size_t>(src_col.len));
+        }
+        return record;
+    }
+
+    bool is_end() const override { return prev_->is_end(); }
+
+    size_t tuple_len() const override { return len_; }
+
+    const std::vector<ColMeta>& cols() const override { return cols_; }
+
+    ColMeta get_col_offset(const TabCol& target) override { return *get_col(cols_, target); }
 
     Rid& rid() override { return abstract_rid_; }
 };
