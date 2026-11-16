@@ -38,6 +38,12 @@ private:
     RmManager* rm_manager_;                   ///< 非拥有指针。
     IndexManager* index_manager_;             ///< 非拥有指针。
 
+    /**
+     * @brief 删除一个已定位的索引，并同步文件、句柄和目录元数据。
+     * @pre index 是 tab_name 的当前目录中的一个索引。
+     */
+    void drop_index_impl(const std::string& tab_name, const IndexMeta& index);
+
 public:
     /**
      * @brief 构造系统管理器。
@@ -78,14 +84,12 @@ public:
     /**
      * @brief 打开数据库并加载表、索引的元数据和文件句柄。
      * @post 当前工作目录保持在该数据库目录中，直到 close_db 返回。
-     * @todo Lab 3：由学生实现数据库打开流程。
      */
     void open_db(const std::string& db_name);
 
     /**
      * @brief 刷盘并关闭当前数据库。
      * @post 当前工作目录回到数据库目录的上一级。
-     * @todo Lab 3：由学生实现数据库关闭流程。
      */
     void close_db();
 
@@ -111,7 +115,6 @@ public:
 
     /**
      * @brief 删除表及其记录文件和索引。
-     * @todo Lab 3：由学生实现删表流程。
      */
     void drop_table(const std::string& tab_name, Context* context);
 
@@ -119,7 +122,6 @@ public:
      * @brief 为指定字段创建索引，并把表中已有记录写入索引。
      * @param unique 为 true 时创建唯一索引。
      * @throws DuplicateKeyError 声明 UNIQUE 但已有数据存在重复 key；此时不留下索引文件和元数据。
-     * @todo Lab 3：由学生实现索引创建流程。
      */
     void create_index(const std::string& tab_name,
                       const std::vector<std::string>& col_names,
@@ -128,13 +130,11 @@ public:
 
     /**
      * @brief 按字段名删除索引。
-     * @todo Lab 3：由学生实现索引删除流程。
      */
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
     /**
      * @brief 按字段元数据删除索引，供内部 DDL 流程复用。
-     * @todo Lab 3：与按字段名删除索引共享同一套核心逻辑。
      */
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context);
 };
